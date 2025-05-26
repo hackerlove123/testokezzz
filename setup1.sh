@@ -1,37 +1,16 @@
-#!/bin/bash
-set -e
+#!/bin/sh
 
 random() {
-  tr -dc A-Za-z0-9 </dev/urandom | head -c5
+  tr </dev/urandom -dc A-Za-z0-9 | head -c5
+  echo
 }
 
 array=(1 2 3 4 5 6 7 8 9 0 a b c d e f)
 gen64() {
   ip64() {
-    echo "${array[RANDOM % 16]}${array[RANDOM % 16]}${array[RANDOM % 16]}${array[RANDOM % 16]}"
+    echo "${array[$RANDOM % 16]}${array[$RANDOM % 16]}${array[$RANDOM % 16]}${array[$RANDOM % 16]}"
   }
   echo "$1:$(ip64):$(ip64):$(ip64):$(ip64)"
-}
-
-install_dependencies() {
-  echo "Installing required packages..."
-  apt update
-  apt install -y gcc net-tools zip libarchive-tools wget curl jq iptables
-}
-
-install_3proxy() {
-  echo "Installing 3proxy latest (v0.9.4)..."
-  URL="https://github.com/3proxy/3proxy/archive/refs/tags/0.9.4.tar.gz"
-  wget -qO- $URL | tar -xzf -
-  cd 3proxy-0.9.4
-  make -f Makefile.Linux
-  mkdir -p /usr/local/etc/3proxy/{bin,logs,stat}
-  cp src/3proxy /usr/local/etc/3proxy/bin/
-  cp ./scripts/rc.d/3proxy.sh /etc/init.d/3proxy || cp ./scripts/rc.d/proxy.sh /etc/init.d/3proxy
-  chmod +x /etc/init.d/3proxy
-  update-rc.d 3proxy defaults
-  cd ..
-  rm -rf 3proxy-0.9.4
 }
 
 gen_3proxy() {
@@ -47,19 +26,25 @@ auth strong
 
 users $(awk -F "/" 'BEGIN{ORS="";} {print $1 ":CL:" $2 " "}' ${WORKDATA})
 
-$(awk -F "/" '{print "auth strong\nallow " $1 "\nproxy -6 -n -a -p" $4 " -i" $3 " -e" $5 "\nflush\n"}' ${WORKDATA})
+$(awk -F "/" '{print "auth strong\n" \
+"allow " $1 "\n" \
+"proxy -6 -n -a -p" $4 " -i" $3 " -e"$5"\n" \
+"flush\n"}' ${WORKDATA})
 EOF
 }
 
 gen_proxy_file_for_user() {
-  awk -F "/" '{print $3 ":" $4 ":" $1 ":" $2 }' ${WORKDATA} > proxy.txt
+  cat >proxy.txt <<EOF
+$(awk -F "/" '{print $3 ":" $4 ":" $1 ":" $2}' ${WORKDATA})
+EOF
 }
 
 upload_2file() {
-  PASS=$(random)
+  local PASS=$(random)
   zip --password $PASS proxy.zip proxy.txt
   JSON=$(curl -s -F "file=@proxy.zip" https://file.io)
-  URL=$(echo "$JSON" | jq -r '.link')
+  URL=$(echo "$JSON" | jq --raw-output '.link')
+
   echo "Proxy is ready! Format IP:PORT:LOGIN:PASS"
   echo "Download zip archive from: ${URL}"
   echo "Password: ${PASS}"
@@ -72,57 +57,60 @@ gen_data() {
 }
 
 gen_iptables() {
-  awk -F "/" '{print "iptables -I INPUT -p tcp --dport " $4 " -m state --state NEW -j ACCEPT"}' ${WORKDATA} > boot_iptables.sh
-  chmod +x boot_iptables.sh
+  awk -F "/" '{print "iptables -I INPUT -p tcp --dport " $4 " -m state --state NEW -j ACCEPT"}' ${WORKDATA}
 }
 
 gen_ifconfig() {
-  awk -F "/" '{print "ip -6 addr add " $5 "/64 dev eth0"}' ${WORKDATA} > boot_ifconfig.sh
-  chmod +x boot_ifconfig.sh
+  awk -F "/" '{print "ifconfig eth0 inet6 add " $5 "/64"}' ${WORKDATA}
 }
 
-main() {
-  echo "Starting proxy installer..."
+echo "Working folder = /home/proxy-installer"
+WORKDIR="/home/proxy-installer"
+WORKDATA="${WORKDIR}/data.txt"
+mkdir -p $WORKDIR && cd $WORKDIR
 
-  install_dependencies
-  install_3proxy
+IP4=$(curl -4 -s icanhazip.com)
+IP6=$(curl -6 -s icanhazip.com | cut -f1-4 -d':')
 
-  WORKDIR="/home/proxy-installer"
-  WORKDATA="${WORKDIR}/data.txt"
-  mkdir -p $WORKDIR
-  cd $WORKDIR
+echo "Internal IPv4 = ${IP4}"
+echo "IPv6 subnet = ${IP6}"
 
-  IP4=$(curl -4 -s icanhazip.com)
-  IP6=$(curl -6 -s icanhazip.com | cut -d: -f1-4)
+echo "How many proxies to create?"
+read COUNT
 
-  echo "Detected IPv4: $IP4"
-  echo "Detected IPv6 subnet: $IP6"
+FIRST_PORT=10000
+LAST_PORT=$((FIRST_PORT + COUNT - 1))
 
-  read -p "How many proxies do you want to create? Example 500: " COUNT
-  FIRST_PORT=10000
-  LAST_PORT=$((FIRST_PORT + COUNT - 1))
+gen_data > $WORKDATA
 
-  gen_data > $WORKDATA
-  gen_iptables
-  gen_ifconfig
+gen_iptables > boot_iptables.sh
+chmod +x boot_iptables.sh
 
-  gen_3proxy > /usr/local/etc/3proxy/3proxy.cfg
+gen_ifconfig > boot_ifconfig.sh
+chmod +x boot_ifconfig.sh
 
-  # Setup rc.local if not exists
-  if [ ! -f /etc/rc.local ]; then
-    echo -e "#!/bin/bash\nexit 0" > /etc/rc.local
-    chmod +x /etc/rc.local
+gen_3proxy > /usr/local/etc/3proxy/3proxy.cfg
+
+# Tạo script khởi động
+if ! grep -q "proxy-installer" /etc/rc.local 2>/dev/null; then
+cat >> /etc/rc.local <<EOF
+bash ${WORKDIR}/boot_iptables.sh
+bash ${WORKDIR}/boot_ifconfig.sh
+ulimit -n 10048
+service 3proxy start
+EOF
+fi
+
+bash /etc/rc.local
+
+gen_proxy_file_for_user
+
+install_jq() {
+  if ! command -v jq >/dev/null 2>&1; then
+    wget -q -O jq https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64
+    chmod +x jq
+    mv jq /usr/local/bin/
   fi
-
-  # Insert startup commands before 'exit 0'
-  sed -i '/^exit 0/i bash '"${WORKDIR}"'/boot_iptables.sh\nbash '"${WORKDIR}"'/boot_ifconfig.sh\nulimit -n 10048\nservice 3proxy start\n' /etc/rc.local
-
-  # Run now
-  bash /etc/rc.local
-
-  gen_proxy_file_for_user
-
-  upload_2file
 }
 
-main
+install_jq && upload_2file
